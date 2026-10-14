@@ -1,4 +1,6 @@
-streamlit>=1.37
+streamlit>=1.65
 pandas
 numpy
+pillow
+onnxruntime
 huggingface_hub
