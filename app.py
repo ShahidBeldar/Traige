@@ -4,12 +4,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from huggingface_hub import hf_hub_download
+from PIL import Image
 
 REPO = "shaikhshahud99/damagetriage-bright"
 CLASSES = ["Intact", "Damaged", "Destroyed"]
 TIERS = ["HIGH", "REVIEW", "LOW"]
 COL = {"HIGH": "#C0392B", "REVIEW": "#D68910", "LOW": "#2E7D5B"}
 ACCENT = "#0B5C7A"
+IM_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IM_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+SAR_MEAN, SAR_STD = 0.2255, 0.1447
 
 st.set_page_config(page_title="DamageTriage", layout="wide")
 
@@ -51,6 +55,48 @@ def load():
     return df, summ, d["pre"], d["post"], d["row"], cams
 
 
+@st.cache_resource(show_spinner="Loading model...")
+def _load_session():
+    import onnxruntime as ort
+
+    path = hf_hub_download(REPO, "bundle/model_fusion.onnx", repo_type="model", token=_token())
+    return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+
+def load_model():
+    try:
+        return _load_session()
+    except Exception:
+        return None
+
+
+def _to_64(img):
+    w, h = img.size
+    side = min(w, h)
+    left, top = (w - side) // 2, (h - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    if side == 64:
+        return img
+    method = Image.Resampling.BOX if side > 64 else Image.Resampling.BICUBIC
+    return img.resize((64, 64), method)
+
+
+def predict(sess, pre_img, post_img):
+    o = np.asarray(_to_64(pre_img.convert("RGB")), dtype=np.float32) / 255.0
+    o = ((o - IM_MEAN) / IM_STD).transpose(2, 0, 1)[None].astype(np.float32)
+    s_ = np.asarray(_to_64(post_img.convert("L")), dtype=np.float32) / 255.0
+    s_ = ((s_ - SAR_MEAN) / SAR_STD)[None, None].astype(np.float32)
+    logits = sess.run(["logits"], {"optical": o, "sar": s_})[0][0]
+    e = np.exp(logits - logits.max())
+    return e / e.sum()
+
+
+def tier_of(score):
+    if score <= 0.3:
+        return "LOW"
+    return "REVIEW" if score <= 0.7 else "HIGH"
+
+
 df, summ, pre, post, rows, cams = load()
 df["color"] = df.tier.map(COL)
 overall = summ["true_damage_rate"]
@@ -63,8 +109,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-t_dash, t_rev, t_map, t_exp, t_about = st.tabs(
-    ["Overview", "Review queue", "Map", "Explainability", "About"]
+t_dash, t_try, t_rev, t_map, t_exp, t_about = st.tabs(
+    ["Overview", "Try it", "Review queue", "Map", "Explainability", "About"]
 )
 
 # ---------------------------------------------------------------- Overview
@@ -119,6 +165,63 @@ with t_dash:
         color=ACCENT,
         height=220,
     )
+
+# ------------------------------------------------------------------ Try it
+with t_try:
+    st.markdown(
+        '<p class="note">Check a single building. Provide a before image (optical) and an after '
+        "image (SAR) of the same building, or pick a demo building. The model returns a damage "
+        "score and a priority tier.</p>",
+        unsafe_allow_html=True,
+    )
+    sess = load_model()
+    if sess is None:
+        st.info(
+            "The live model is not available right now. The other tabs still work with the "
+            "precomputed predictions."
+        )
+    else:
+        source = st.radio("Input", ["Upload images", "Demo building"], horizontal=True)
+        pre_in = post_in = truth = None
+        if source == "Upload images":
+            u1, u2 = st.columns(2)
+            f1 = u1.file_uploader("Before image (optical, color)", type=["png", "jpg", "jpeg"], key="up_pre")
+            f2 = u2.file_uploader("After image (SAR, grayscale)", type=["png", "jpg", "jpeg"], key="up_post")
+            if f1 is not None and f2 is not None:
+                pre_in = Image.open(f1)
+                post_in = Image.open(f2)
+        else:
+            i_demo = st.slider("Demo building", 0, len(rows) - 1, 0)
+            pre_in = Image.fromarray(pre[i_demo])
+            post_in = Image.fromarray(post[i_demo])
+            truth = CLASSES[int(df.iloc[int(rows[i_demo])].true_label)]
+
+        if pre_in is None:
+            st.info("Upload both images to see a result.")
+        else:
+            p = predict(sess, pre_in, post_in)
+            score = float(1 - p[0])
+            tier = tier_of(score)
+            v1, v2, v3 = st.columns([1, 1, 2])
+            v1.image(pre_in.convert("RGB"), caption="Before (optical)", width=190)
+            v2.image(post_in.convert("L"), caption="After (SAR)", width=190)
+            with v3:
+                st.markdown(
+                    f'Priority tier: <span style="color:{COL[tier]};font-weight:700">{tier}</span>'
+                    f"  \nDamage score: **{score:.2f}**",
+                    unsafe_allow_html=True,
+                )
+                for name, pk in zip(CLASSES, p):
+                    st.progress(float(pk), text=f"{name}: {pk:.0%}")
+            if truth is not None:
+                with st.expander("Show ground truth (for evaluation only)"):
+                    st.write(truth)
+        st.warning(
+            "The model was trained on 64 by 64 pixel crops, each centered on one building with "
+            "about 50 percent margin, from imagery at roughly 0.3 m per pixel. Images that do "
+            "not look like that give unreliable scores. Non-square images are center-cropped. "
+            "The score ranks buildings for inspection; it does not certify a building as safe."
+        )
 
 # ------------------------------------------------------------ Review queue
 with t_rev:
@@ -262,7 +365,8 @@ with t_about:
         "- Noto is a single region with about 70 image tiles, and the numbers come from one run.\n"
         "- The optical branch only sees pre-event imagery, so it may learn building type "
         "rather than damage.\n"
-        "- Predictions are precomputed. This app does not run the model live."
+        "- The overview, review queue, map and explainability tabs show precomputed predictions on "
+        "the Noto event. Only the Try it tab runs the model live."
     )
     st.subheader("Data")
     st.markdown(
